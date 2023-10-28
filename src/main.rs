@@ -110,10 +110,10 @@ struct DockerConfig {
 impl Config {
     fn new(args: Cli) -> Self {
         Self {
-            app_name_label: format!("{}.app_name", &args.label_prefix),
-            port_label: format!("{}.app_name", &args.label_prefix),
-            external_label: format!("{}.app_name", &args.label_prefix),
-            auth_label: format!("{}.app_name", &args.label_prefix),
+            app_name_label: format!("{}.app", &args.label_prefix),
+            port_label: format!("{}.port", &args.label_prefix),
+            external_label: format!("{}.external", &args.label_prefix),
+            auth_label: format!("{}.auth", &args.label_prefix),
             local_domain: format!("{}.{}", &args.local_domain_prefix, &args.domain_name),
             external_domain: args.domain_name,
             local_caddy: CaddyConfig {
