@@ -1,0 +1,15 @@
+[package]
+name = "docker-caddy-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+docker-api = "0.14.0"
+tokio = {version = "1.33", features = ["full"]}
+tokio-stream = "0.1"
+indoc = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+clap = { version = "4.4", features = ["derive", "env", "unicode", "wrap_help"] }
