@@ -1,6 +1,6 @@
 use docker_api::models::{ContainerInspect200Response, EventMessage};
-use docker_api::opts::ContainerListOpts;
-use docker_api::{conn::TtyChunk, Docker, opts::EventsOpts, Result as DockerResult};
+use docker_api::opts::{ContainerListOpts, ContainerFilter, ExecCreateOpts, ExecStartOpts};
+use docker_api::{conn::TtyChunk, Docker, opts::EventsOpts};
 use tokio_stream::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
@@ -74,10 +74,6 @@ struct Cli {
     /// The general domain name, e.g., example.com
     #[arg(long, visible_alias="dn", env)]
     domain_name: String,
-    /// The path to the docker executable on the host system, used to shell out and trigger a
-    /// reload of Caddy (should be replaced by using the Docker API)
-    #[arg(long, visible_alias="dbp", env, default_value="/usr/local/bin/docker")]
-    docker_bin_path: PathBuf,
     /// Path to the docker.sock file, used to communicate with the Docker API
     #[arg(long, visible_alias="dsp", env, default_value="/var/run/docker.sock")]
     docker_socket_path: PathBuf,
@@ -99,11 +95,15 @@ struct CaddyConfig {
     bin_path: PathBuf,
     config_dir: PathBuf,
     snippets_dir: PathBuf,
-    on_docker: bool,
+    location: CaddyLocation,
+}
+
+enum CaddyLocation {
+    Local,
+    Docker(String),
 }
 
 struct DockerConfig {
-    docker_bin_path: PathBuf,
     docker_socket_path: PathBuf,
 }
 
@@ -120,16 +120,15 @@ impl Config {
                 bin_path: args.local_caddy_bin_path,
                 config_dir: args.local_caddy_config_dir,
                 snippets_dir: args.local_caddy_snippets_dir,
-                on_docker: args.local_caddy_on_docker,
+                location: CaddyLocation::Local, 
             },
             docker_caddy: CaddyConfig {
                 bin_path: args.docker_caddy_bin_path,
                 config_dir: args.docker_caddy_config_dir,
                 snippets_dir: args.docker_caddy_snippets_dir,
-                on_docker: true,
+                location: CaddyLocation::Docker("caddy".to_string()),
             },
             docker_config: DockerConfig {
-                docker_bin_path: args.docker_bin_path,
                 docker_socket_path: args.docker_socket_path
             },
         }
@@ -144,8 +143,17 @@ fn config() -> &'static Config {
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 type ApplicationData = HashMap<String, AppData>;
 
-pub fn new_docker() -> DockerResult<Docker> {
+#[cfg(unix)]
+pub fn new_docker() -> Result<Docker> {
     Ok(Docker::unix(&config().docker_config.docker_socket_path))
+}
+
+#[cfg(not(unix))]
+use Result as DockerResult;
+
+#[cfg(not(unix))]
+pub fn new_docker() -> DockerResult<Docker> {
+    Docker::new("tcp://127.0.0.1:8080")
 }
 
 pub fn print_chunk(chunk: TtyChunk) {
@@ -333,7 +341,7 @@ impl Listener {
         }
     }
 
-    fn write_caddy_snippets(&self) -> Result<()> {
+    async fn write_caddy_snippets(&self) -> Result<()> {
         let mut docker_hosts_file = File::options().create(true).write(true).truncate(true).open(config().docker_caddy.snippets_dir.join("docker-hosts"))?;
         let mut local_docker_hosts_file = File::options().create(true).write(true).truncate(true).open(config().local_caddy.snippets_dir.join("docker-hosts"))?;
         let mut external_hosts = Vec::new();
@@ -380,12 +388,13 @@ impl Listener {
         docker_hosts_file.sync_all()?;
         local_docker_hosts_file.sync_all()?;
 
-        self.reload_caddy()?;
+        self.reload_caddy().await?;
 
         Ok(())
     }
 
-    fn reload_local_caddy(&self, config: &CaddyConfig) -> Result<()> {
+    async fn reload_local_caddy(&self, config: &CaddyConfig) -> Result<()> {
+        info!("reloading local-caddy...");
         let exit_status = std::process::Command::new(&config.bin_path)
             .current_dir(config.config_dir.to_str().ok_or("unable to get local caddy config dir as string")?)
             .args(["reload"])
@@ -400,43 +409,46 @@ impl Listener {
         Ok(())
     }
 
-    fn reload_docker_caddy(&self, config: &CaddyConfig) -> Result<()> {
-        let exit_status = std::process::Command::new(&crate::config().docker_config.docker_bin_path)
-            .args([
-                "exec",
-                "-w",
-                config.config_dir.to_str().ok_or("unable to get docker caddy config dir as string")?,
-                config.bin_path.to_str().ok_or("unable to get docker caddy bin path as string")?,
-                "sh",
-                "-c",
-                "DO_API_KEY=\"$(cat \"$DO_API_KEY_FILE\")\" caddy reload",
-            ])
-            .spawn()?
-            .wait()?;
+    async fn reload_docker_caddy(&self, config: &CaddyConfig) -> Result<()> {
+        info!("reloading docker-caddy...");
+        let docker = new_docker()?;
+        let opts = ContainerListOpts::builder().filter(vec![ContainerFilter::Name("caddy".to_string())]).build();
+        let search_results = docker.containers().list(&opts).await?;
+        if search_results.len() != 1 {
+            return Err("expected only a single container with the caddy container name".into());
+        }
 
-        if !exit_status.success() {
-            error!(code=exit_status.code(), "unable to reload Docker Caddy");
-            return Err(format!("unable to reload Docker Caddy - exited with status {}", exit_status.code().unwrap_or(-1)).into());
+        let caddy_container = docker.containers().get(search_results[0].id.as_ref().expect("containers must always have an ID"));
+
+        let create_opts = ExecCreateOpts::builder()
+            .working_dir(&config.config_dir)
+            .attach_stdout(true)
+            .attach_stderr(true)
+            .command(vec!["sh", "-c", format!("DO_API_KEY=\"$(cat \"$DO_API_KEY_FILE\")\" {} reload", config.bin_path.to_str().ok_or("could not turn caddy docker bin path into string")?).as_str()])
+            .build();
+        let start_opts = ExecStartOpts::builder().build();
+
+        let mut result = caddy_container.exec(&create_opts, &start_opts).await?;
+        while let Some(chunk) = result.next().await {
+            match chunk? {
+                TtyChunk::StdIn(_) => unreachable!("never attached"),
+                TtyChunk::StdOut(bytes) => info!("{}", str::from_utf8(&bytes).unwrap_or_default()),
+                TtyChunk::StdErr(bytes) => warn!("{}", str::from_utf8(&bytes).unwrap_or_default()),
+            }
         }
 
         Ok(())
     }
 
-    fn reload_caddy(&self) -> Result<()> {
-        if config().docker_caddy.on_docker {
-            info!("reloading docker-caddy...");
-            self.reload_docker_caddy(&config().docker_caddy)?;
-        } else {
-            info!("reloading local-caddy...");
-            self.reload_local_caddy(&config().docker_caddy)?;
+    async fn reload_caddy(&self) -> Result<()> {
+        match config().docker_caddy.location {
+            CaddyLocation::Local => self.reload_local_caddy(&config().docker_caddy).await?,
+            CaddyLocation::Docker(_) => self.reload_docker_caddy(&config().docker_caddy).await?,
         }
 
-        if config().local_caddy.on_docker {
-            info!("reloading docker-caddy...");
-            self.reload_docker_caddy(&config().local_caddy)?;
-        } else {
-            info!("reloading local-caddy...");
-            self.reload_local_caddy(&config().local_caddy)?;
+        match config().local_caddy.location {
+            CaddyLocation::Local => self.reload_local_caddy(&config().local_caddy).await?,
+            CaddyLocation::Docker(_) => self.reload_docker_caddy(&config().local_caddy).await?,
         }
 
         Ok(())
@@ -468,7 +480,7 @@ impl Listener {
         }
 
         //write_caddy_snippets(&app_data)?;
-        self.write_caddy_snippets()?;
+        self.write_caddy_snippets().await?;
 
         let opts = EventsOpts::builder().build();
         let mut events = docker.events(&opts);
@@ -505,7 +517,7 @@ impl Listener {
                                         continue;
                                     }
                                 }
-                                self.write_caddy_snippets()?;
+                                self.write_caddy_snippets().await?;
                             }
                         }
                         "destroy" => {
@@ -514,7 +526,7 @@ impl Listener {
                             if let Some(app_name) = event_summary.app_name {
                                 if let Some(ad) = self.app_data.get_mut(&app_name) {
                                     ad.containers.retain(|ad| ad.container_id != event_summary.id);
-                                    self.write_caddy_snippets()?;
+                                    self.write_caddy_snippets().await?;
                                 } else {
                                     warn!(app_name, "no AppData found for event - app not registered?");
                                 }
@@ -531,7 +543,7 @@ impl Listener {
                                         ad.container_name = event_summary.container_name.clone();
                                         ad.hostname = event_summary.container_name.clone();
                                     });
-                                    self.write_caddy_snippets()?;
+                                    self.write_caddy_snippets().await?;
                                 }
                             }
                         }
