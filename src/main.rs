@@ -1,17 +1,24 @@
+mod powerdns;
+
 use docker_api::models::{ContainerInspect200Response, EventMessage};
 use docker_api::opts::{ContainerListOpts, ContainerFilter, ExecCreateOpts, ExecStartOpts};
 use docker_api::{conn::TtyChunk, Docker, opts::EventsOpts};
 use tokio_stream::StreamExt;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str;
 use std::sync::OnceLock;
 use indoc::indoc;
 use tracing_subscriber;
 use tracing::{info, warn, debug, error};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use local_ip_address::{local_ip, local_ipv6};
+use local_ip_address::Error::LocalIpAddressNotFound;
+use reqwest::Url;
+use serde::{Deserialize, Serialize};
 
 /// Watch docker for Container events, write those out to a set of Caddy snippets, then
 /// trigger a reload of both Caddy instances.
@@ -44,6 +51,9 @@ struct Cli {
     /// the "local" Caddy is using Host networking, for example.
     #[arg(long, visible_alias="lcod", env)]
     local_caddy_on_docker: bool,
+    /// If the "local" Caddy is running on Docker, then this is the container name
+    #[arg(long, visible_alias="lcdcn", env, default_value = None)]
+    local_caddy_docker_container_name: Option<String>,
     /// Path to the Caddy binary inside the Docker file (defaults to just "caddy" as it's on the
     /// path).
     #[arg(long, visible_alias="dcbp", env, default_value = "caddy")]
@@ -77,6 +87,25 @@ struct Cli {
     /// Path to the docker.sock file, used to communicate with the Docker API
     #[arg(long, visible_alias="dsp", env, default_value="/var/run/docker.sock")]
     docker_socket_path: PathBuf,
+    /// DNS provider to use to automatically update local DNS records
+    #[arg(value_enum, long, visible_alias="ldnsp", env, default_value_t=DnsProviderCli::None)]
+    local_dns_provider: DnsProviderCli,
+    /// PowerDNS configuration options
+    #[command(flatten)]
+    power_dns_cli_opts: Option<PowerDnsCliOpts>,
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+enum DnsProviderCli {
+    /// Do not update DNS
+    None,
+    /// Update PowerDNS using its HTTP API. Must set all --power-dns-* options
+    PowerDNS,
+}
+
+enum DnsProvider {
+    None,
+    PowerDNS(PowerDnsCliOpts)
 }
 
 struct Config {
@@ -89,6 +118,7 @@ struct Config {
     local_caddy: CaddyConfig,
     docker_caddy: CaddyConfig,
     docker_config: DockerConfig,
+    dns_provider: DnsProvider,
 }
 
 struct CaddyConfig {
@@ -109,6 +139,15 @@ struct DockerConfig {
 
 impl Config {
     fn new(args: Cli) -> Self {
+        let local_caddy_location = if args.local_caddy_on_docker {
+            if let Some(container_name) = args.local_caddy_docker_container_name {
+                CaddyLocation::Docker(container_name)
+            } else {
+                panic!("container name was not specified for local caddy")
+            }
+        } else {
+            CaddyLocation::Local
+        };
         Self {
             app_name_label: format!("{}.app", &args.label_prefix),
             port_label: format!("{}.port", &args.label_prefix),
@@ -120,7 +159,7 @@ impl Config {
                 bin_path: args.local_caddy_bin_path,
                 config_dir: args.local_caddy_config_dir,
                 snippets_dir: args.local_caddy_snippets_dir,
-                location: CaddyLocation::Local, 
+                location: local_caddy_location,
             },
             docker_caddy: CaddyConfig {
                 bin_path: args.docker_caddy_bin_path,
@@ -131,6 +170,10 @@ impl Config {
             docker_config: DockerConfig {
                 docker_socket_path: args.docker_socket_path
             },
+            dns_provider: match args.local_dns_provider {
+                DnsProviderCli::None => DnsProvider::None,
+                DnsProviderCli::PowerDNS => DnsProvider::PowerDNS(args.power_dns_cli_opts.expect("power-dns config must be provided if DNS Provider is set to PowerDNS"))
+            }
         }
     }
 }
@@ -138,6 +181,16 @@ impl Config {
 fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
     CONFIG.get_or_init(|| { Config::new(Cli::parse()) })
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct StaticHost {
+    host: String,
+    a: Option<String>,
+    aaaa: Option<String>,
+    cname: Option<String>,
+    #[serde(rename="useLocal")]
+    use_local: Option<bool>,
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -150,6 +203,7 @@ pub fn new_docker() -> Result<Docker> {
 
 #[cfg(not(unix))]
 use Result as DockerResult;
+use crate::powerdns::{PowerDnsApiRecord, PowerDnsApiRRSet, PowerDnsApiRRSets, PowerDnsClient, PowerDnsCliOpts, RRSetChangeType, RRSetType};
 
 #[cfg(not(unix))]
 pub fn new_docker() -> DockerResult<Docker> {
@@ -173,15 +227,27 @@ struct ContainerSummaryInternal {
     id: String,
     container_name: String,
     labels: Option<HashMap<String, String>>,
+    network_mode_host: bool,
 }
 
 impl ContainerSummaryInternal {
     fn new_from_inspect(container: &ContainerInspect200Response) -> Result<Self> {
         let container_name = container.name.as_ref().map(|s| s.as_str()).map(|s| s.strip_prefix("/").unwrap_or(s).to_string()).unwrap();
+        let network_mode_host = if let Some(ref network_settings) = container.network_settings {
+            if let Some(ref networks) = network_settings.networks {
+                networks.contains_key("host")
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         Ok(ContainerSummaryInternal {
             id: container.id.clone().unwrap(),
             container_name,
             labels: container.config.as_ref().unwrap().labels.clone(),
+            network_mode_host,
         })
     }
 }
@@ -220,6 +286,7 @@ struct AppData {
     port: u16,
     external: bool,
     auth_type: CaddyAuthType,
+    network_mode_host: bool,
 }
 
 impl AppData {
@@ -240,6 +307,7 @@ impl AppData {
             let app_name = labels[&config().app_name_label].clone();
             let port: u16 = labels[&config().port_label].parse()?;
             let external: bool = labels.get(&config().external_label).map(|b| b.parse()).unwrap_or(Ok(false))?;
+            let network_mode_host: bool = container.network_mode_host;
             let auth_type = labels.get(&config().auth_label).map(|s| match s.as_str() {
                 "oidc" => CaddyAuthType::Oidc,
                 "headers" => CaddyAuthType::TrustedHeaders, 
@@ -253,6 +321,7 @@ impl AppData {
                 port,
                 external,
                 auth_type,
+                network_mode_host,
             }))
         } else {
             return Ok(None)
@@ -283,7 +352,20 @@ impl AppData {
     }
 
     fn format_docker_caddy(&self) -> String {
-        let targets = self.containers.iter().map(|adc| format!("http://{}:{}", adc.hostname, self.port)).collect::<Vec<String>>().join(" ");
+        let targets = self.containers
+            .iter()
+            .map(|adc|
+                format!(
+                    "http://{}:{}",
+                    match self.network_mode_host {
+                        true => "host.docker.internal",
+                        false => &adc.hostname
+                    },
+                    self.port
+                )
+            )
+            .collect::<Vec<String>>()
+            .join(" ");
         format!(indoc!("
             @{app_name} host {app_name}.{domain}
               handle @{app_name} {{
@@ -332,13 +414,23 @@ impl AppContainerData {
 
 struct Listener {
     app_data: ApplicationData,
+    dns_client: PowerDnsClient,
 }
 
 impl Listener {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self> {
+        let dns_conf = match &config().dns_provider {
+            DnsProvider::PowerDNS(conf) => conf,
+            _ => return Err("currently only support PowerDNS as a client".into()),
+        };
+        Ok(Self {
             app_data: HashMap::new(),
-        }
+            dns_client: PowerDnsClient::new(
+                Url::parse(&dns_conf.url)?,
+                dns_conf.server.to_string(),
+                dns_conf.api_key.to_string(),
+            )?
+        })
     }
 
     async fn write_caddy_snippets(&self) -> Result<()> {
@@ -390,6 +482,8 @@ impl Listener {
 
         self.reload_caddy().await?;
 
+        self.update_dns().await?;
+
         Ok(())
     }
 
@@ -409,10 +503,12 @@ impl Listener {
         Ok(())
     }
 
-    async fn reload_docker_caddy(&self, config: &CaddyConfig) -> Result<()> {
-        info!("reloading docker-caddy...");
+    async fn reload_docker_caddy(&self, config: &CaddyConfig, container_name: &str) -> Result<()> {
+        info!(container_name, "reloading docker-caddy...");
         let docker = new_docker()?;
-        let opts = ContainerListOpts::builder().filter(vec![ContainerFilter::Name("caddy".to_string())]).build();
+        let opts = ContainerListOpts::builder()
+            .filter(vec![ContainerFilter::Name(format!("^/{}$", container_name))])
+            .build();
         let search_results = docker.containers().list(&opts).await?;
         if search_results.len() != 1 {
             return Err("expected only a single container with the caddy container name".into());
@@ -443,13 +539,72 @@ impl Listener {
     async fn reload_caddy(&self) -> Result<()> {
         match config().docker_caddy.location {
             CaddyLocation::Local => self.reload_local_caddy(&config().docker_caddy).await?,
-            CaddyLocation::Docker(_) => self.reload_docker_caddy(&config().docker_caddy).await?,
+            CaddyLocation::Docker(ref container_name) => self.reload_docker_caddy(&config().docker_caddy, container_name).await?,
         }
 
         match config().local_caddy.location {
             CaddyLocation::Local => self.reload_local_caddy(&config().local_caddy).await?,
-            CaddyLocation::Docker(_) => self.reload_docker_caddy(&config().local_caddy).await?,
+            CaddyLocation::Docker(ref container_name) => self.reload_docker_caddy(&config().local_caddy, container_name).await?,
         }
+
+        Ok(())
+    }
+
+    async fn update_dns(&self) -> Result<()> {
+        // let mut hosts = config().static_hosts.clone();
+
+        let local_ipv4 = match local_ip() {
+            Ok(v) => Some(match v {
+                IpAddr::V4(v) => v,
+                _ => return Err("updating DNS, expected IPv4, got IPv6".into())
+            }),
+            Err(LocalIpAddressNotFound) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let local_ipv6 = match local_ipv6() {
+            Ok(v) => Some(match v {
+                IpAddr::V6(v) => v,
+                _ => return Err("updating DNS, expected IPv6, got IPv4".into())
+            }),
+            Err(LocalIpAddressNotFound) => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut internal_dns = Vec::new();
+        let mut external_dns = Vec::new();
+
+        for (key, ad) in self.app_data.iter() {
+            if ad.containers.is_empty() {
+                warn!(app_name=key, "app is in the map but has no running containers - deleting from DNS");
+                if ad.external {
+                    internal_dns.push(PowerDnsApiRRSet::delete_ipv4(&ad.app_name, &config().external_domain));
+                    external_dns.push(PowerDnsApiRRSet::delete_ipv6(&ad.app_name, &config().external_domain));
+                } else {
+                    internal_dns.push(PowerDnsApiRRSet::delete_ipv4(&ad.app_name, &config().local_domain));
+                }
+            } else if ad.external {
+                if let Some(ref ipv4) = local_ipv4 {
+                    internal_dns.push(PowerDnsApiRRSet::new_ipv4(&ad.app_name, &config().external_domain, ipv4));
+                    external_dns.push(PowerDnsApiRRSet::new_ipv4(&ad.app_name, &config().external_domain, ipv4));
+                }
+                if let Some(ref ipv6) = local_ipv6 {
+                    internal_dns.push(PowerDnsApiRRSet::new_ipv6(&ad.app_name, &config().external_domain, ipv6));
+                    external_dns.push(PowerDnsApiRRSet::new_ipv6(&ad.app_name, &config().external_domain, ipv6));
+                }
+            } else {
+                if let Some(ref ipv4) = local_ipv4 {
+                    internal_dns.push(PowerDnsApiRRSet::new_ipv4(&ad.app_name, &config().local_domain, ipv4));
+                }
+                if let Some(ref ipv6) = local_ipv6 {
+                    internal_dns.push(PowerDnsApiRRSet::new_ipv6(&ad.app_name, &config().local_domain, ipv6));
+                }
+            };
+        }
+
+        self.dns_client.update_rrsets(
+            &format!("{}.", config().external_domain),
+            PowerDnsApiRRSets { rrsets: internal_dns }
+        ).await?;
 
         Ok(())
     }
@@ -596,7 +751,7 @@ async fn main() -> Result<()> {
         .pretty()
         .init();
 
-    let mut listener = Listener::new();
+    let mut listener = Listener::new()?;
 
     listener.listen().await?;
     
